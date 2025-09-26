@@ -1,0 +1,336 @@
+"""
+Car Rental Management System (Starter)
+--------------------------------------
+A minimal, assignment-ready Python project that models a small
+car rental business (e.g., 9 Volvo XC90s) using OOP, basic
+algorithms (availability checks, pricing), error handling, and
+an interactive CLI.
+
+How to run:
+    python rental_system.py
+
+Notes for your ICT702 report:
+- Problem Definition: Managing cars, customers, and bookings.
+- Design: Classes below; include a class diagram and simple data-flow.
+- Implementation Choices: dataclasses, type hints, JSON persistence, CLI.
+- Ethical: Store only what you need, avoid printing sensitive data.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field, asdict
+from datetime import date, datetime, timedelta
+from typing import Dict, List, Optional
+import json
+import uuid
+import os
+
+# -----------------------------
+# Domain Models
+# -----------------------------
+@dataclass
+class Car:
+    car_id: str
+    registration: str
+    make: str
+    model: str
+    year: intq
+    odometer_km: int = 0
+    daily_rate_aud: float = 120.0
+    active: bool = True  # set False if decommissioned / in long-term service
+
+    def __post_init__(self):
+        if self.daily_rate_aud <= 0:
+            raise ValueError("daily_rate_aud must be positive")
+        if len(self.registration.strip()) == 0:
+            raise ValueError("registration cannot be empty")
+
+
+@dataclass
+class Customer:
+    customer_id: str
+    full_name: str
+    license_no: str
+    phone: str
+    email: str
+
+    def __post_init__(self):
+        if not self.full_name.strip():
+            raise ValueError("full_name cannot be empty")
+        if not self.license_no.strip():
+            raise ValueError("license_no cannot be empty")
+
+
+@dataclass
+class Rental:
+    rental_id: str
+    car_id: str
+    customer_id: str
+    start_date: date
+    end_date: date
+    daily_rate_aud: float
+    returned: bool = False
+    total_cost_aud: Optional[float] = None
+
+    def __post_init__(self):
+        if self.end_date < self.start_date:
+            raise ValueError("end_date cannot be before start_date")
+        if self.daily_rate_aud <= 0:
+            raise ValueError("daily_rate_aud must be positive")
+
+    @property
+    def days(self) -> int:
+        # Inclusive of start; end-exclusive pricing (common practice)
+        return (self.end_date - self.start_date).days or 1
+
+    def compute_cost(self) -> float:
+        return round(self.days * self.daily_rate_aud, 2)
+
+
+# -----------------------------
+# Rental Manager (Application Layer)
+# -----------------------------
+class RentalManager:
+    def __init__(self):
+        self.cars: Dict[str, Car] = {}
+        self.customers: Dict[str, Customer] = {}
+        self.rentals: Dict[str, Rental] = {}
+
+    # ---------- Car Ops ----------
+    def add_car(self, registration: str, make: str, model: str, year: int, daily_rate_aud: float = 120.0, odometer_km: int = 0) -> Car:
+        car_id = str(uuid.uuid4())
+        car = Car(car_id, registration.upper(), make, model, year, odometer_km, daily_rate_aud)
+        if any(c.registration == car.registration for c in self.cars.values()):
+            raise ValueError(f"Car with registration {registration} already exists")
+        self.cars[car_id] = car
+        return car
+
+    def list_available_cars(self, start: date, end: date) -> List[Car]:
+        return [c for c in self.cars.values() if c.active and self._is_car_available(c.car_id, start, end)]
+
+    def _is_car_available(self, car_id: str, start: date, end: date) -> bool:
+        for r in self.rentals.values():
+            if r.car_id != car_id or r.returned:
+                continue
+            # Overlap check (end dates are exclusive)
+            if not (end <= r.start_date or start >= r.end_date):
+                return False
+        return True
+
+    # ---------- Customer Ops ----------
+    def add_customer(self, full_name: str, license_no: str, phone: str, email: str) -> Customer:
+        customer_id = str(uuid.uuid4())
+        cust = Customer(customer_id, full_name.strip(), license_no.strip(), phone.strip(), email.strip())
+        self.customers[customer_id] = cust
+        return cust
+
+    # ---------- Rental Ops ----------
+    def rent_car(self, car_id: str, customer_id: str, start: date, end: date, daily_rate_override: Optional[float] = None) -> Rental:
+        if car_id not in self.cars:
+            raise KeyError("car_id not found")
+        if customer_id not in self.customers:
+            raise KeyError("customer_id not found")
+        if end <= start:
+            raise ValueError("End date must be after start date")
+        if not self._is_car_available(car_id, start, end):
+            raise ValueError("Car is not available for the requested dates")
+
+        rate = daily_rate_override if (daily_rate_override and daily_rate_override > 0) else self.cars[car_id].daily_rate_aud
+        rental_id = str(uuid.uuid4())
+        rental = Rental(rental_id, car_id, customer_id, start, end, rate)
+        self.rentals[rental_id] = rental
+        return rental
+
+    def return_car(self, rental_id: str) -> Rental:
+        if rental_id not in self.rentals:
+            raise KeyError("rental_id not found")
+        rental = self.rentals[rental_id]
+        if rental.returned:
+            raise ValueError("Rental already returned")
+        rental.returned = True
+        rental.total_cost_aud = rental.compute_cost()
+        return rental
+
+    # ---------- Reports ----------
+    def active_rentals(self) -> List[Rental]:
+        return [r for r in self.rentals.values() if not r.returned]
+
+    def revenue_between(self, start: date, end: date) -> float:
+        total = 0.0
+        for r in self.rentals.values():
+            # Include rentals that *end* within the window and are returned
+            if r.returned and start <= r.end_date <= end:
+                total += r.total_cost_aud or r.compute_cost()
+        return round(total, 2)
+
+    # ---------- Persistence ----------
+    def save(self, path: str) -> None:
+        data = {
+            "cars": [asdict(c) for c in self.cars.values()],
+            "customers": [asdict(c) for c in self.customers.values()],
+            "rentals": [
+                {
+                    **asdict(r),
+                    "start_date": r.start_date.isoformat(),
+                    "end_date": r.end_date.isoformat(),
+                }
+                for r in self.rentals.values()
+            ],
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    @staticmethod
+    def load(path: str) -> "RentalManager":
+        mgr = RentalManager()
+        if not os.path.exists(path):
+            return mgr
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for c in data.get("cars", []):
+            mgr.cars[c["car_id"]] = Car(**c)
+        for cu in data.get("customers", []):
+            mgr.customers[cu["customer_id"]] = Customer(**cu)
+        for r in data.get("rentals", []):
+            r["start_date"] = date.fromisoformat(r["start_date"])  # type: ignore
+            r["end_date"] = date.fromisoformat(r["end_date"])      # type: ignore
+            mgr.rentals[r["rental_id"]] = Rental(**r)
+        return mgr
+
+
+# -----------------------------
+# Helper functions (CLI)
+# -----------------------------
+DATE_FMT = "%Y-%m-%d"
+DATA_PATH = "rental_data.json"
+
+
+def parse_date(s: str) -> date:
+    try:
+        return datetime.strptime(s.strip(), DATE_FMT).date()
+    except Exception as e:
+        raise ValueError(f"Invalid date '{s}'. Use YYYY-MM-DD.") from e
+
+
+def seed_nine_xc90s(mgr: RentalManager):
+    if mgr.cars:
+        return  # don't duplicate if loading from file
+    # You can replace regos with your actual plates
+    base_regos = [
+        "XC90A01", "XC90A02", "XC90A03", "XC90A04", "XC90A05",
+        "XC90A06", "XC90A07", "XC90A08", "XC90A09",
+    ]
+    for i, reg in enumerate(base_regos, start=1):
+        mgr.add_car(registration=reg, make="Volvo", model="XC90", year=2008, daily_rate_aud=120.0, odometer_km=180000 + i*1000)
+
+
+# -----------------------------
+# Simple CLI Interface
+# -----------------------------
+MENU = """
+\nCar Rental Management – Menu
+[1] List available cars for dates
+[2] Add customer
+[3] Rent a car
+[4] Return a car
+[5] Show active rentals
+[6] Show revenue for a period
+[7] Save data
+[8] Quit\n"""
+
+
+def main():
+    mgr = RentalManager.load(DATA_PATH)
+    seed_nine_xc90s(mgr)
+    print("Loaded data. Cars:", len(mgr.cars), "Customers:", len(mgr.customers), "Rentals:", len(mgr.rentals))
+
+    while True:
+        try:
+            print(MENU)
+            choice = input("Choose an option: ").strip()
+
+            if choice == "1":
+                s = input("Start date (YYYY-MM-DD): ")
+                e = input("End date (YYYY-MM-DD): ")
+                start, end = parse_date(s), parse_date(e)
+                avail = mgr.list_available_cars(start, end)
+                if not avail:
+                    print("No cars available.")
+                else:
+                    for c in avail:
+                        print(f"- {c.registration} {c.make} {c.model} {c.year} | ${c.daily_rate_aud}/day")
+
+            elif choice == "2":
+                name = input("Full name: ")
+                lic = input("Driver license no: ")
+                phone = input("Phone: ")
+                email = input("Email: ")
+                cust = mgr.add_customer(name, lic, phone, email)
+                print("Customer added:", cust.customer_id)
+
+            elif choice == "3":
+                car_reg = input("Car registration: ").upper().strip()
+                car = next((c for c in mgr.cars.values() if c.registration == car_reg), None)
+                if not car:
+                    print("Car not found.")
+                    continue
+                cust_name = input("Customer full name (existing or new): ").strip()
+                # Try to find existing by name (simple demo logic)
+                cust = next((cu for cu in mgr.customers.values() if cu.full_name.lower() == cust_name.lower()), None)
+                if not cust:
+                    print("Customer not found. Please add the customer first (menu 2).")
+                    continue
+                s = input("Start date (YYYY-MM-DD): ")
+                e = input("End date (YYYY-MM-DD): ")
+                start, end = parse_date(s), parse_date(e)
+                try:
+                    rental = mgr.rent_car(car.car_id, cust.customer_id, start, end)
+                    print("Rental created:", rental.rental_id, "| Cost estimate:", rental.compute_cost())
+                except Exception as ex:
+                    print("Error:", ex)
+
+            elif choice == "4":
+                rid = input("Rental ID to return: ").strip()
+                try:
+                    rental = mgr.return_car(rid)
+                    print(f"Returned. Total cost: ${rental.total_cost_aud:.2f}")
+                except Exception as ex:
+                    print("Error:", ex)
+
+            elif choice == "5":
+                act = mgr.active_rentals()
+                if not act:
+                    print("No active rentals.")
+                else:
+                    for r in act:
+                        car = mgr.cars[r.car_id]
+                        cust = mgr.customers[r.customer_id]
+                        print(f"- {r.rental_id} | {car.registration} -> {cust.full_name} | {r.start_date} to {r.end_date} | ${r.daily_rate_aud}/day")
+
+            elif choice == "6":
+                s = input("From date (YYYY-MM-DD): ")
+                e = input("To date (YYYY-MM-DD): ")
+                start, end = parse_date(s), parse_date(e)
+                total = mgr.revenue_between(start, end)
+                print(f"Revenue between {start} and {end}: ${total:.2f}")
+
+            elif choice == "7":
+                mgr.save(DATA_PATH)
+                print("Saved.")
+
+            elif choice == "8":
+                mgr.save(DATA_PATH)
+                print("Saved. Goodbye!")
+                break
+
+            else:
+                print("Invalid option. Try again.")
+
+        except KeyboardInterrupt:
+            print("\nInterrupted. Saving and exiting...")
+            mgr.save(DATA_PATH)
+            break
+        except Exception as ex:
+            print("Unexpected error:", ex)
+
+
+if __name__ == "__main__":
+    main()
